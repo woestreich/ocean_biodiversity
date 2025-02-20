@@ -1,0 +1,273 @@
+---
+title: "analysis"
+author: "Will Oestreich"
+date: '2025-02-18'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE, # show warnings
+  message = FALSE, # show messages
+  error = TRUE, # do not interrupt generation in case of errors,
+  echo = TRUE  # show R code
+)
+```
+
+```{r}
+library(tidyverse) 
+library(dplyr)
+library(sf) 
+library(terra)
+library(raster)
+library(arrow)
+library(stringr)
+library(MetBrewer)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(scales)
+library(cowplot)
+library(fst)
+```
+
+## load in parquet
+```{r}
+obis_snapshot <- "data/obis_20241202.parquet"
+```
+
+## open dataset
+```{r}
+db <- open_dataset(obis_snapshot)
+```
+
+## quality filters
+```{r}
+obis_filter <- db |>
+  filter(!str_detect(flags, "DATE_IN_FUTURE")) |> 
+  filter(!str_detect(flags, "DATE_BEFORE_MIN")) |> 
+  filter(!str_detect(flags, "NO_COORD")) |> 
+  filter(!str_detect(flags, "ZERO_COORD")) |> 
+  filter(!str_detect(flags, "LON_OUT_OF_RANGE")) |> 
+  filter(!str_detect(flags, "LAT_OUT_OF_RANGE")) |> 
+  filter(!str_detect(flags, "NO_DEPTH")) |> 
+  filter(!str_detect(flags, "ON_LAND")) |> 
+  mutate(bath_obs_prop_min = minimumDepthInMeters/bathymetry) |>
+  mutate(bath_obs_prop_max = maximumDepthInMeters/bathymetry) |>
+  mutate(bathymetry = round(as.numeric(bathymetry), 0)) |>
+  mutate(minimumDepthInMeters = round(as.numeric(minimumDepthInMeters), 0)) |>
+  mutate(depth_diff = bathymetry - minimumDepthInMeters) |>
+  mutate(depth_quality_category = ifelse(bath_obs_prop_min <= 1.05 & bath_obs_prop_min >= 0, "depth_good", "depth_bad")) |>
+  mutate(latitude = round(decimalLatitude,3), 
+         longitude = round(decimalLongitude,3)) |>
+  group_by(bathymetry, minimumDepthInMeters, bath_obs_prop_min, bath_obs_prop_max, depth_quality_category, latitude, longitude) |>
+  count() |> 
+  collect()
+```
+
+## explore outcome of custom depth quality flag
+```{r}
+depth_category_sums <- obis_filter |>
+  group_by(depth_quality_category) |>
+  summarize(total_n = sum(n))
+head(depth_category_sums)
+```
+
+## filter out records with bad depth vs. bathymetry comparison flag
+```{r}
+obis_clean <- obis_filter |> 
+  filter(depth_quality_category == "depth_good")
+```
+
+## the custom flag lets in records with depth up to 5% greater than bottom depth. for these records, assign depth to bottom depth and make the proportional depth = 1
+```{r}
+obis_clean <- obis_clean |>
+  mutate(bath_obs_prop_min = ifelse(bath_obs_prop_min > 1, 1, bath_obs_prop_min)) |>
+  mutate(minimumDepthInMeters = ifelse(bath_obs_prop_min > 1, bathymetry, minimumDepthInMeters))
+```
+
+## depth zones
+```{r}
+obis_clean <- obis_clean %>%
+  mutate(zone = case_when(
+    bathymetry < 200 ~ "coastal or shallow",
+    bathymetry >= 200 & minimumDepthInMeters < 200 ~ "coastal or shallow",
+    bathymetry >= 200 & minimumDepthInMeters > 200  ~ "deep",
+  ))
+```
+
+## summarize by depth zone
+```{r}
+obis_zone_summary <- obis_clean %>%
+  filter(!is.na(zone)) %>%  
+  group_by(zone) %>%
+  summarise(total_n = sum(n, na.rm = TRUE))
+
+obis_zone_summary$pct <- obis_zone_summary$total_n/sum(obis_zone_summary$total_n, na.rm = TRUE)
+head(obis_zone_summary)
+```
+
+## save cleaned OBIS dataset and depth zone summary
+```{r}
+write.csv(obis_zone_summary,"outputs/obis_zone_summary.csv")
+write_fst(obis_clean,"outputs/obis_clean.fst",compress = 90)
+```
+
+## FIGURE PANEL A: maps - centered on international date line
+```{r}
+df_spatial <- obis_clean |> 
+  dplyr::filter(!is.na(latitude), 
+         !is.na(longitude)) |> 
+  st_as_sf(coords = c("longitude", "latitude"), 
+           crs = "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m")
+```
+
+```{r}
+zone_list <- split(df_spatial, df_spatial$zone)
+
+raster_list <- list()
+
+crs <- "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m" 
+for (zone_name in names(zone_list)) {
+  zone_data <- zone_list[[zone_name]]
+  
+  ras_temp <- raster(xmn=-180, xmx=180, ymn=-90, ymx=90, resolution=c(0.1, 0.1), vals=NA)
+  raster_zone <- rasterize(zone_data, ras_temp, field = "n", fun = 'sum')
+  
+  terra_zone <- terra::rast(raster_zone)
+  terra_zone_proj <- terra::project(terra_zone, crs, mask=TRUE)
+  
+  raster_list[[zone_name]] <- terra_zone_proj
+}
+
+raster_stack <- terra::rast(raster_list)
+```
+
+```{r} 
+rob_proj <- "+proj=robin +lon_0=180"  # Change to Pacific-centric projection
+raster_stack_robin <- project(raster_stack, rob_proj)
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+## attempt to fix meridian issues
+polygon <- st_polygon(x = list(rbind(c(-0.0001, 90),
+                                     c(0, 90),
+                                     c(0, -90),
+                                     c(-0.0001, -90),
+                                     c(-0.0001, 90)))) %>%
+  st_sfc() %>%
+  st_set_crs(4326)
+
+world2 <- world %>% st_difference(polygon)
+world_robinson <- st_transform(world2, 
+                               crs = '+proj=robin +lon_0=180 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs')
+
+# Custom colormap
+colors <- c("#4491B2", "#306F9F", "#1C4772", "#102F4F")
+
+# Set the colorbar limits
+color_limits <- c(0, 6)
+
+# Loop through each raster layer and create/save a separate plot
+for (i in 1:nlyr(raster_stack_robin)) {
+  # Extract the current layer as a data frame
+  raster_df <- as.data.frame(raster_stack_robin[[i]], xy = TRUE)
+  colnames(raster_df) <- c("x", "y", "value")  # Standardize column names
+  
+  # Get the layer name
+  layer_name <- names(raster_stack_robin)[i]
+  
+  # Create the plot
+   plot <- ggplot() +
+    geom_raster(data = raster_df, aes(x = x, y = y, fill = log10(value))) +
+    geom_sf(data = world_robinson, fill = "grey", color = NA) +
+    scale_fill_gradientn(
+      colors = colors, 
+      name = expression(log[10]("observations")),  # Add a label for the colorbar
+      limits = color_limits,
+      guide = "none"
+    ) +
+    coord_sf(crs = rob_proj) +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "top",
+      legend.text = element_text(size = 24),  # Adjust font size for legend labels
+      legend.title = element_text(size = 24)  # Adjust font size for the legend title
+    )
+  
+  # Display the plot 
+  print(plot)
+  
+  # Save the plot to a file
+  ggsave(filename = paste0("figures/", layer_name, "_map.png"), plot = plot, width = 10, height = 6, dpi = 300)
+}
+```
+
+## FIGURE PANEL B: depth histogram
+```{r} 
+p <- obis_clean |>
+  ggplot(aes(x = minimumDepthInMeters, weight = n)) +
+  geom_histogram(binwidth = 100, fill = "#306F9F") +
+  theme_bw() +
+  coord_flip() +
+  scale_x_reverse() +
+  labs(x = "Depth (m)", y = "Biodiversity observations") +
+  geom_vline(xintercept = 200, linetype = "dashed", color = "black")
+
+ggsave("figures/depth.png",p,width=2.3,height=5.2,units="in")
+```
+
+## FIGURE PANEL C: pie charts of biodiversity observations and habitable volume
+```{r} 
+zone_colors <- c("deep" = "#1C4772",
+                 "coastal or shallow" = "#4491B2",
+                 "land" = "#156E33")
+
+# Pie chart for biodiversity observations
+pa <- ggplot(pie, aes(x = "", y = pct, fill = zone)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = zone_colors) +
+  theme_void() +
+  theme(legend.position = "none")
+
+# Pie chart for habitable space by volume
+pb <- ggplot(pie, aes(x = "", y = space, fill = zone)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = zone_colors) +
+  theme_void() +
+  theme(legend.position = "none")
+
+ggsave("figures/pie_a.png",pa)
+ggsave("figures/pie_b.png",pb)
+```
+
+## FIGURE PANEL D: observations by node, classified by income level
+```{r}
+nodes_classification <- read_csv("data/nodes_obs_classified.csv") |>
+  dplyr::select(node_name, n, class)
+
+node_obs <- nodes_classification |>
+  group_by(class) |>
+  summarise(n = sum(n)) |>
+  arrange(-n) |>
+  mutate(all = sum(n)) |>
+  mutate(perc = n/all*100) |>
+  arrange(-perc)
+
+node_obs$class <- factor(
+  node_obs$class,
+  levels = c("Not classified", "Low income","Lower middle income","Upper middle income","High income"))
+
+p <- ggplot(node_obs, aes(x = class, y = perc)) + geom_col(fill = "#306F9F") + coord_flip() +
+  ylab("Biodiversity observations\nmanaged (%)") +
+  xlab("") +
+  ylim(c(0,100)) +
+  theme_bw() +
+  theme(axis.text.y = element_text(angle = 45, hjust = 1))
+
+ggsave("figures/nodes.png",p,width=3,height=3.3,units="in")
+```
+
