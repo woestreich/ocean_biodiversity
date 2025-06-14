@@ -1,5 +1,5 @@
 # ocean_biodiversity
-To produce analyses and figure for Oestreich et al. "Collective science to inform global ocean protections" (in review).
+To produce analyses and figure for Oestreich et al. (2025) "Collective science to inform global ocean protections" in Ecology Letters.
 
 Reproducing these analyses requires downloading an instance of the Ocean Biodiversity Information System (OBIS) database, as a .parquet file, which exceeds the maximum file size for a GitHub repository. 
 
@@ -9,4 +9,10 @@ The analyses conducted for this paper used the OBIS instance from Dec 2, 2024 (o
 
 The analysis.Rmd script included here expects the obis parquet file to be saved to the "data" directory of this repository.
 
+Full paper co-author list:
+William K. Oestreich
+Max F. Czapansky
+Kakani Katija
+Nicholas R. Record
+Melissa S. Chapman
 
