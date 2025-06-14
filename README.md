@@ -9,10 +9,5 @@ The analyses conducted for this paper used the OBIS instance from Dec 2, 2024 (o
 
 The analysis.Rmd script included here expects the obis parquet file to be saved to the "data" directory of this repository.
 
-Full paper co-author list:
-William K. Oestreich
-Max F. Czapansky
-Kakani Katija
-Nicholas R. Record
-Melissa S. Chapman
+Full paper co-author list: William K. Oestreich, Max F. Czapansky, Kakani Katija, Nicholas R. Record, Melissa S. Chapman
 
